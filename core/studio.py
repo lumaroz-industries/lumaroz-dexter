@@ -55,9 +55,11 @@ from core import gemini
 _LADDERS: dict[str, tuple[str, ...]] = {
     # Gemini native image models: generate AND edit, understand long prompts,
     # render text well, keep a character consistent across edits.
-    "image": ("gemini-3-pro-image-preview",
-              "gemini-2.5-flash-image",
-              "gemini-2.5-flash-image-preview"),
+    # Cheapest first: 2.5 Flash Image is the one with free-tier allowance;
+    # the Pro image model is billing-only and is tried last.
+    "image": ("gemini-2.5-flash-image",
+              "gemini-2.5-flash-image-preview",
+              "gemini-3-pro-image-preview"),
     # Imagen: pure text-to-image, photographic quality, several at once.
     "imagen": ("imagen-4.0-generate-001",
                "imagen-4.0-fast-generate-001",
@@ -230,6 +232,11 @@ def _request_error(err: str) -> Optional[str]:
     return None
 
 
+def _not_on_free_tier(err: str) -> bool:
+    low = err.lower().replace(" ", "")
+    return "limit:0" in low or "limit\":0" in low or "free_tier" in low and "limit" in low
+
+
 def _run_ladder(kind: str, attempt: Callable[[str], object],
                 log: Callable[[str], None] = print):
     """Call attempt(model) down the ladder until one returns."""
@@ -248,7 +255,11 @@ def _run_ladder(kind: str, attempt: Callable[[str], object],
             said = _request_error(err)
             if said:
                 raise StudioError(said)
-            if gemini.is_quota_error(err):
+            if gemini.is_quota_error(err) and _not_on_free_tier(err):
+                # 429 with "limit: 0": the free tier does not include this model
+                # at all. It will not recover in five minutes — rest it for hours.
+                gemini._cool(model, gemini._GONE_SECONDS)
+            elif gemini.is_quota_error(err):
                 gemini._cool(model, gemini._COOLDOWN_SECONDS)
             elif gemini.is_gone_error(err) or "billing" in err.lower() or "paid" in err.lower():
                 gemini._cool(model, gemini._GONE_SECONDS)
@@ -288,6 +299,66 @@ def _finish_reason(resp) -> str:
             return str(resp.prompt_feedback.block_reason or "")
         except Exception:
             return ""
+
+
+# ── the free, keyless image fallback ─────────────────────────────────────────
+#
+# Google's image models are rate-limited, and on a free key they may allow few
+# requests a day or none at all. So when Google cannot make the picture, Dexter
+# makes it with Pollinations — a free public text-to-image service that needs
+# no account and no key — rather than answering "out of quota".
+#
+# `studio_image_source` in config/api_keys.json chooses:
+#     "auto"    Google first, the free generator when Google can't (default)
+#     "free"    always the free generator — never spends any Google quota
+#     "google"  Google only; never send a prompt anywhere else
+#
+# Privacy: in "auto" and "free" the prompt text is sent to pollinations.ai.
+FREE_IMAGE_URL = "https://image.pollinations.ai/prompt/{prompt}"
+FREE_MODEL_TAG = "pollinations-flux (free)"
+
+_AR_SIZES = {"1:1": (1024, 1024), "16:9": (1344, 768), "9:16": (768, 1344),
+             "4:3": (1152, 864), "3:4": (864, 1152), "3:2": (1216, 832),
+             "2:3": (832, 1216), "4:5": (896, 1120), "5:4": (1120, 896),
+             "21:9": (1536, 640)}
+
+
+def image_source() -> str:
+    v = str(_config().get("studio_image_source", "auto") or "auto").lower()
+    return v if v in ("auto", "free", "google") else "auto"
+
+
+def _free_images(prompt: str, aspect_ratio: str, count: int,
+                 log: Callable[[str], None] = print) -> list[tuple[bytes, str]]:
+    import random
+    from urllib.parse import quote
+    import requests
+    w, h = _AR_SIZES.get(aspect_ratio, (1024, 1024))
+    out = []
+    for i in range(count):
+        url = FREE_IMAGE_URL.format(prompt=quote(prompt[:1500], safe=""))
+        params = {"width": w, "height": h, "seed": random.randint(1, 2**31 - 1),
+                  "nologo": "true", "model": "flux", "enhance": "true"}
+        last = ""
+        for attempt in range(3):              # it is a shared queue; be patient
+            try:
+                r = requests.get(url, params=params, timeout=150,
+                                 headers={"User-Agent": "Lumaroz-Dexter/1.0"})
+                ctype = r.headers.get("content-type", "")
+                if r.status_code == 200 and ctype.startswith("image/") and len(r.content) > 2048:
+                    out.append((r.content, ctype.split(";")[0]))
+                    break
+                last = f"HTTP {r.status_code} {ctype}"
+                if r.status_code in (400, 403):
+                    break
+            except Exception as e:                # noqa: BLE001
+                last = f"{type(e).__name__}: {e}"
+            log(f"[Studio] free generator attempt {attempt + 1} failed — {last[:160]}")
+            time.sleep(3 * (attempt + 1))
+    if not out:
+        raise StudioError("The free image generator is busy right now — "
+                          "try again in a minute.")
+    return out
 
 
 # ── images ───────────────────────────────────────────────────────────────────
@@ -377,6 +448,16 @@ def generate_image(prompt: str, aspect_ratio: str = "1:1", count: int = 1,
              if quality in ("ultra", "photo")
              else [("image", via_gemini), (imagen_kind, via_imagen)])
 
+    def via_free():
+        imgs = _free_images(full, aspect_ratio, count, log)
+        paths = [_save(d, prompt, _ext_for(m), FREE_MODEL_TAG, "image · free generator")
+                 for d, m in imgs]
+        return Creation(paths=paths, model=FREE_MODEL_TAG)
+
+    source = image_source()
+    if source == "free" or (source == "auto" and not gemini.api_key()):
+        return via_free()
+
     last_err: Optional[StudioError] = None
     for kind, fn in order:
         try:
@@ -384,9 +465,14 @@ def generate_image(prompt: str, aspect_ratio: str = "1:1", count: int = 1,
             paths = [_save(d, prompt, _ext_for(m), model, "image") for d, m in imgs]
             return Creation(paths=paths, model=model, text=words)
         except StudioError as e:
-            if "safety" in str(e).lower() or "api key" in str(e).lower():
+            if "safety" in str(e).lower():
+                raise                      # never route around a safety refusal
+            if "api key" in str(e).lower() and source == "google":
                 raise
             last_err = e
+    if source == "auto":
+        log(f"[Studio] Google could not make it ({last_err}) — using the free generator.")
+        return via_free()
     raise last_err or StudioError("I couldn't create that image.")
 
 

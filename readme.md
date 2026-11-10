@@ -43,6 +43,21 @@ saved to `~/Pictures/Lumaroz`, with its prompt saved alongside it.
 | 🔎 | **Deep research**: a thinking model with Google Search grounding, URL reading, Google Maps and Python code execution, with numbered sources | *"Research…"*, *"Read these links and summarise"*, *"Best ramen near Shibuya"* |
 | 🌐 | **Live Google Search**: the conversation itself is grounded in Google Search for quick facts | *"Who won last night?"* |
 
+**Images never stop at "out of quota".** Dexter tries the cheapest Gemini
+image model first (2.5 Flash Image). If Google can't make the picture (free-tier
+limits, no billing, no key), it switches to a **free keyless generator**
+(Pollinations / FLUX) and still delivers the image. Choose the behaviour with
+`studio_image_source` in `config/api_keys.json`:
+
+| Value | Behaviour |
+|---|---|
+| `"auto"` *(default)* | Google first, free generator when Google can't |
+| `"free"` | Always the free generator: uses no Google quota at all |
+| `"google"` | Google only: prompts are never sent anywhere else |
+
+In `auto` and `free`, the prompt text is sent to pollinations.ai. Editing an
+existing image still needs Google.
+
 Every capability runs on a **model ladder**. If a model is out of quota,
 missing for your key or overloaded, Dexter rests it for a while and moves on to
 the next one. A free-tier key still gets real work done, and new models can be
