@@ -189,6 +189,12 @@ _LADDERS = {
 LIVE_MODELS = (
     "models/gemini-3.1-flash-live-preview",
     "models/gemini-2.5-flash-native-audio-preview-12-2025",
+    # Older native-audio and half-cascade Live models: each has its OWN quota
+    # bucket, so on a free key they are extra minutes of conversation. A name
+    # this key cannot use is set aside for six hours after one attempt.
+    "models/gemini-2.5-flash-native-audio-preview-09-2025",
+    "models/gemini-live-2.5-flash-preview",
+    "models/gemini-2.0-flash-live-001",
 )
 
 # The Live model to use for one-shot calls. main.py owns the real one; this is
@@ -260,7 +266,12 @@ def _cool(model: str, seconds: float = _COOLDOWN_SECONDS) -> None:
 
 
 def is_quota_error(err: str) -> bool:
-    return "429" in err or "RESOURCE_EXHAUSTED" in err
+    """Out of quota. REST says 429 / RESOURCE_EXHAUSTED; the Live API closes the
+    socket with 1011 and only says "You exceeded your current quota" in words."""
+    low = err.lower()
+    return ("429" in err or "RESOURCE_EXHAUSTED" in err
+            or "exceeded your current quota" in low or "quota exceeded" in low
+            or "check your plan and billing" in low)
 
 
 def is_unavailable_error(err: str) -> bool:

@@ -2504,6 +2504,8 @@ class DexterLive:
                     self._interrupted          = False
 
                     print("[DEXTER] Connected.")
+                    self._quota_wait = 0
+                    self._quota_told = False
                     if _resumed_with:
                         # Say it plainly: the difference between "it reconnected"
                         # and "it reconnected and still knows what we were doing"
@@ -2612,7 +2614,8 @@ class DexterLive:
 
                 err_str = str(e)
                 print(f"[DEXTER] Error ({type(e).__name__}): {e}")
-                traceback.print_exc()
+                if not _gemini.is_quota_error(err_str):
+                    traceback.print_exc()        # quota is not a bug; no stack trace
 
                 # Out of quota, or this model is not available to this key —
                 # step down the ladder and reconnect straight away. This is the
@@ -2621,14 +2624,27 @@ class DexterLive:
                 # limit always arrives mid-conversation.
                 if _gemini.note_live_failure(live_model, err_str):
                     nxt = _gemini.live_model()
-                    self.ui.write_log(
-                        f"SYS: Switching to {nxt.split('/')[-1]} — the previous "
-                        f"model is out of quota."
-                        if nxt != live_model else
-                        "SYS: Every live model is rate-limited — retrying.")
-                    self._conn_backoff = 0 if nxt != live_model else 15
-                    if nxt == live_model:
-                        await asyncio.sleep(self._conn_backoff)
+                    if nxt != live_model:
+                        self.ui.write_log(
+                            f"SYS: Switching to {nxt.split('/')[-1]} — the previous "
+                            f"model is unavailable or out of quota.")
+                        self._conn_backoff = 0
+                        continue
+                    # Every live model has been tried. Waiting longer each time
+                    # beats hammering an exhausted key every few seconds, and the
+                    # user is told once, in plain words, what is going on.
+                    self._quota_wait = min(max(30, getattr(self, "_quota_wait", 0) * 2), 300)
+                    if not getattr(self, "_quota_told", False):
+                        self._quota_told = True
+                        self.ui.write_log(
+                            "SYS: Google says this API key is out of quota for live "
+                            "voice. Fix: wait for the daily reset, turn on billing at "
+                            "aistudio.google.com, or enter another key (⚙ → Setup). "
+                            "You can still type commands below.")
+                    print(f"[DEXTER] Every live model is out of quota — "
+                          f"retrying in {self._quota_wait}s.")
+                    self._conn_backoff = 0
+                    await asyncio.sleep(self._quota_wait)
                     continue
 
                 # Turn-taking / media / thinking knobs rejected by the server
