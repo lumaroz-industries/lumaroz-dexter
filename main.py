@@ -640,6 +640,7 @@ class DexterLive:
         self.ui.on_interrupt      = self.interrupt
         self.ui.on_voice_change   = self._on_voice_change     # voice picker → rebuild session
         self.ui.on_audio_device_change = self._on_audio_device_change
+        self.ui._win.on_key_change = self._on_key_change
         self._reconnect_event: asyncio.Event | None = None
         self._reconnect_keep = True   # False → next rebuild drops the resumption handle
 
@@ -896,6 +897,19 @@ class DexterLive:
         appear to do nothing. Losing context here is acceptable because changing
         voice is a deliberate, rare act; losing it on a dropped packet was not."""
         self.request_reconnect(keep_context=False, reason="new voice")
+
+    def _on_key_change(self):
+        """A new API key was saved (⚙ → CHANGE API KEY). Forget every quota or
+        availability verdict — they belonged to the old key — and reconnect."""
+        try:
+            with _gemini._cool_lock:
+                _gemini._cooldown.clear()
+        except Exception:
+            pass
+        self._quota_wait = 0
+        self._quota_told = False
+        self._key_changed = True        # wakes a quota back-off early
+        self.request_reconnect(keep_context=False, reason="new API key")
 
     def _on_audio_device_change(self):
         """Microphone or speaker changed. Both streams are opened inside the
@@ -2644,7 +2658,11 @@ class DexterLive:
                     print(f"[DEXTER] Every live model is out of quota — "
                           f"retrying in {self._quota_wait}s.")
                     self._conn_backoff = 0
-                    await asyncio.sleep(self._quota_wait)
+                    self._key_changed = False
+                    for _ in range(int(self._quota_wait)):
+                        if self._key_changed:          # a new key: try now
+                            break
+                        await asyncio.sleep(1)
                     continue
 
                 # Turn-taking / media / thinking knobs rejected by the server

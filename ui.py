@@ -4670,6 +4670,7 @@ class MainWindow(QMainWindow):
         self.on_text_command   = None
         self.on_remote_clicked = None   # callable: () -> (url, key) | None
         self.on_interrupt      = None   # callable: () -> None — stop DEXTER mid-speech
+        self.on_key_change     = None   # callable: () -> None — a new API key was saved
         self.on_voice_change   = None   # callable: () -> None — rebuild session with new voice
         self.on_audio_device_change = None  # callable: () -> None — reopen audio streams
         self._confirm_overlay  = None   # live ConfirmBanner, if one is on screen
@@ -6122,6 +6123,15 @@ class MainWindow(QMainWindow):
         self._autostart_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._autostart_btn.clicked.connect(self._toggle_autostart)
         lay.addWidget(self._autostart_btn)
+
+        key_btn = QPushButton("🔑  CHANGE API KEY")
+        key_btn.setFixedHeight(26)
+        key_btn.setFont(QFont(UI_FONT, 7))
+        key_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        key_btn.setStyleSheet(_BTN_STYLE_DIM)
+        key_btn.setToolTip("Enter a different Google AI Studio API key")
+        key_btn.clicked.connect(self._change_api_key)
+        lay.addWidget(key_btn)
 
         cust_btn = QPushButton("⚙  CUSTOMISE ASSISTANT")
         cust_btn.setFixedHeight(26)
@@ -7622,19 +7632,53 @@ class MainWindow(QMainWindow):
         ov.show()
         self._overlay = ov
 
+    def _change_api_key(self):
+        """⚙ → CHANGE API KEY: reopen the key screen without touching anything else."""
+        try:
+            self._close_setup()
+        except Exception:
+            pass
+        if self._overlay is not None:
+            self._overlay.raise_()
+            return
+        self._show_setup()
+
     def _on_setup_done(self, key: str, os_name: str):
+        # Merge into the existing config. Rewriting the file with only these
+        # two fields wiped the assistant's name, voice, wallpaper, devices and
+        # every other setting whenever the key was entered again.
         os.makedirs(CONFIG_DIR, exist_ok=True)
-        API_FILE.write_text(
-            json.dumps({"gemini_api_key": key, "os_system": os_name}, indent=4),
-            encoding="utf-8",
-        )
+        data: dict = {}
+        if API_FILE.exists():
+            try:
+                data = json.loads(API_FILE.read_text(encoding="utf-8")) or {}
+            except Exception:
+                data = {}
+        changed = (data.get("gemini_api_key") or "") != key.strip()
+        data["gemini_api_key"] = key.strip()
+        data["os_system"] = os_name
+        API_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+        try:
+            from core import gemini as _g
+            _g.api_key(refresh=True)
+        except Exception:
+            pass
+        was_ready = self._ready
         self._ready = True
         if self._overlay:
             self._overlay.hide()
             self._overlay = None
         self._apply_state("LISTENING")
         self._assistant_name = _read_full_config().get("assistant_name", "DEXTER") or "DEXTER"
-        self._log.append_log(f"SYS: Initialised. OS={os_name.upper()}. {self._assistant_name} online.")
+        if was_ready and changed:
+            self._log.append_log("SYS: New API key saved — reconnecting with it.")
+        else:
+            self._log.append_log(f"SYS: Initialised. OS={os_name.upper()}. {self._assistant_name} online.")
+        if changed and callable(getattr(self, "on_key_change", None)):
+            try:
+                self.on_key_change()
+            except Exception as e:
+                print(f"[Setup] key change hook failed: {e}")
 
 
 class _RootShim:
