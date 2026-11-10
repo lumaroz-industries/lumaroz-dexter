@@ -315,7 +315,7 @@ def _finish_reason(resp) -> str:
 #
 # Privacy: in "auto" and "free" the prompt text is sent to pollinations.ai.
 FREE_IMAGE_URL = "https://image.pollinations.ai/prompt/{prompt}"
-FREE_MODEL_TAG = "pollinations-flux (free)"
+FREE_MODEL_TAG = "pollinations (free)"
 
 _AR_SIZES = {"1:1": (1024, 1024), "16:9": (1344, 768), "9:16": (768, 1344),
              "4:3": (1152, 864), "3:4": (864, 1152), "3:2": (1216, 832),
@@ -328,33 +328,65 @@ def image_source() -> str:
     return v if v in ("auto", "free", "google") else "auto"
 
 
+_free_lock = __import__("threading").Lock()
+_free_last = 0.0
+FREE_SPACING_S = 46          # anonymous limit: 1 image / 45 s per IP
+
+
 def _free_images(prompt: str, aspect_ratio: str, count: int,
                  log: Callable[[str], None] = print) -> list[tuple[bytes, str]]:
+    """Make images on Pollinations. Anonymous use is limited to one image
+    every 45 seconds per IP (it answers 402 FREE_LIMIT "Retry after Ns"), so
+    requests are spaced and a refusal waits the time it names. A free key from
+    enter.pollinations.ai (`pollinations_key` in the config) lifts the limit
+    and removes the watermark."""
+    global _free_last
     import random
     from urllib.parse import quote
     import requests
+    key = str(_config().get("pollinations_key") or "").strip()
     w, h = _AR_SIZES.get(aspect_ratio, (1024, 1024))
+    if not key and count > 1:
+        log("[Studio] free generator without a key makes one image at a time "
+            f"(45 s apart) — making 1 of {count}.")
+        count = 1
+    headers = {"User-Agent": "Lumaroz-Dexter/1.0"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
     out = []
-    for i in range(count):
+    for _ in range(count):
         url = FREE_IMAGE_URL.format(prompt=quote(prompt[:1500], safe=""))
         params = {"width": w, "height": h, "seed": random.randint(1, 2**31 - 1),
-                  "nologo": "true", "model": "flux", "enhance": "true"}
+                  "model": "flux", "enhance": "true"}
+        if key:
+            params["nologo"] = "true"
         last = ""
-        for attempt in range(3):              # it is a shared queue; be patient
-            try:
-                r = requests.get(url, params=params, timeout=150,
-                                 headers={"User-Agent": "Lumaroz-Dexter/1.0"})
+        for attempt in range(4):
+            with _free_lock:                         # one request at a time
+                if not key:
+                    wait = FREE_SPACING_S - (time.monotonic() - _free_last)
+                    if wait > 0:
+                        log(f"[Studio] free generator: waiting {wait:.0f}s for its rate limit…")
+                        time.sleep(wait)
+                try:
+                    r = requests.get(url, params=params, timeout=180, headers=headers)
+                except Exception as e:                # noqa: BLE001
+                    r, last = None, f"{type(e).__name__}: {e}"
+                _free_last = time.monotonic()
+            if r is not None:
                 ctype = r.headers.get("content-type", "")
                 if r.status_code == 200 and ctype.startswith("image/") and len(r.content) > 2048:
                     out.append((r.content, ctype.split(";")[0]))
                     break
-                last = f"HTTP {r.status_code} {ctype}"
-                if r.status_code in (400, 403):
+                body = r.text[:400] if "json" in ctype or "text" in ctype else ""
+                last = f"HTTP {r.status_code} {body}".strip()
+                if r.status_code in (400, 401, 403):
                     break
-            except Exception as e:                # noqa: BLE001
-                last = f"{type(e).__name__}: {e}"
-            log(f"[Studio] free generator attempt {attempt + 1} failed — {last[:160]}")
-            time.sleep(3 * (attempt + 1))
+            m = re.search(r"retry after (\d+)\s*s", last, re.I)
+            pause = min(60, int(m.group(1)) + 1) if m else (10 * (attempt + 1))
+            log(f"[Studio] free generator busy ({last[:90]}) — retrying in {pause}s")
+            time.sleep(pause)
+            _free_last = 0.0 if m else _free_last    # the wait above already covered it
     if not out:
         raise StudioError("The free image generator is busy right now — "
                           "try again in a minute.")
@@ -382,8 +414,8 @@ def _gemini_image(model: str, contents: list, aspect_ratio: str, size: str):
         response_modalities=["TEXT", "IMAGE"],
         image_config=types.ImageConfig(**img_cfg) if img_cfg else None,
     )
-    resp = _client(180_000).models.generate_content(
-        model=model, contents=contents, config=cfg)
+    client = _client(180_000)       # keep a reference: a dropped Client closes itself
+    resp = client.models.generate_content(model=model, contents=contents, config=cfg)
     images, words = [], []
     for part in _parts(resp):
         blob = getattr(part, "inline_data", None)
@@ -417,6 +449,9 @@ def generate_image(prompt: str, aspect_ratio: str = "1:1", count: int = 1,
     if not prompt:
         raise StudioError("Tell me what to create.")
     count = max(1, min(4, int(count or 1)))
+    if quality in ("photo", "ultra") and not style:
+        style = ("photorealistic, shot on a full-frame camera, natural light, "
+                 "fine detail, shallow depth of field")
     full = _style_prompt(prompt, style, negative)
 
     def via_gemini(model):
@@ -433,7 +468,8 @@ def generate_image(prompt: str, aspect_ratio: str = "1:1", count: int = 1,
         cfg = dict(number_of_images=count, aspect_ratio=ar)
         if negative and "imagen-3" in model:
             cfg["negative_prompt"] = negative
-        resp = _client(180_000).models.generate_images(
+        client = _client(180_000)
+        resp = client.models.generate_images(
             model=model, prompt=_style_prompt(prompt, style, "" if "imagen-3" in model else negative),
             config=types.GenerateImagesConfig(**cfg))
         imgs = [(g.image.image_bytes, g.image.mime_type or "image/png")
@@ -443,10 +479,14 @@ def generate_image(prompt: str, aspect_ratio: str = "1:1", count: int = 1,
                               "Try rephrasing it.")
         return imgs, ""
 
+    # Imagen: the google-genai SDK refuses generate_images with an AI Studio
+    # key ("only supported in ... Enterprise Agent Platform mode"), so it is
+    # offered only when the config says the key is a Vertex one.
     imagen_kind = {"ultra": "imagen_ultra", "fast": "imagen_fast"}.get(quality, "imagen")
-    order = ([(imagen_kind, via_imagen), ("image", via_gemini)]
-             if quality in ("ultra", "photo")
-             else [("image", via_gemini), (imagen_kind, via_imagen)])
+    order = [("image", via_gemini)]
+    if _config().get("studio_vertex"):
+        order = ([(imagen_kind, via_imagen)] + order if quality in ("ultra", "photo")
+                 else order + [(imagen_kind, via_imagen)])
 
     def via_free():
         imgs = _free_images(full, aspect_ratio, count, log)
@@ -592,7 +632,8 @@ def generate_speech(text: str, voice: str = "Kore", direction: str = "",
             prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=_voice(voice))))
 
     def attempt(model):
-        resp = _client(180_000).models.generate_content(
+        client = _client(180_000)
+        resp = client.models.generate_content(
             model=model, contents=script,
             config=types.GenerateContentConfig(response_modalities=["AUDIO"],
                                                speech_config=speech))

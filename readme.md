@@ -35,7 +35,7 @@ saved to `~/Pictures/Lumaroz`, with its prompt saved alongside it.
 
 | | Capability | What you say |
 |---|---|---|
-| 🎨 | **Image generation**: Gemini native image ("Nano Banana" / Pro), then Imagen 4 for photoreal and ultra quality, 1 to 4 images, 10 aspect ratios | *"Create a cyberpunk Tokyo alley, cinematic, 16:9"* |
+| 🎨 | **Image generation**: Gemini native image ("Nano Banana" / Pro), with a free keyless fallback; Imagen 4 on Vertex keys. 1 to 4 images, 10 aspect ratios | *"Create a cyberpunk Tokyo alley, cinematic, 16:9"* |
 | 🖌️ | **Image editing and composition**: change, restyle, remove, add, recolour, or combine several photos | *"Make it night-time"*, *"Put this logo on a hoodie"* |
 | 🎬 | **Video generation**: Veo 3.1, then Veo 3 and Veo 2, with native sound. Text-to-video or image-to-video, 16:9 or 9:16 | *"Animate that image, slow push-in, rain falling"* |
 | 🎙️ | **Studio voice-overs**: 30 Gemini TTS voices, performance direction, two-speaker podcasts | *"Record this as a calm narration in the Charon voice"* |
@@ -55,8 +55,14 @@ limits, no billing, no key), it switches to a **free keyless generator**
 | `"free"` | Always the free generator: uses no Google quota at all |
 | `"google"` | Google only: prompts are never sent anywhere else |
 
-In `auto` and `free`, the prompt text is sent to pollinations.ai. Editing an
-existing image still needs Google.
+In `auto` and `free`, the prompt text is sent to pollinations.ai. Without a key
+the free generator makes **one image every 45 seconds** (Dexter waits for it
+automatically) and adds a small watermark. A free key from
+<https://enter.pollinations.ai> removes both: add `"pollinations_key": "…"` to
+`config/api_keys.json`. Editing an existing image still needs Google.
+
+Imagen 4 only works with a Google Cloud (Vertex AI) key. The Google SDK refuses
+it with an AI Studio key, so Dexter skips it unless `"studio_vertex": true` is set.
 
 Every capability runs on a **model ladder**. If a model is out of quota,
 missing for your key or overloaded, Dexter rests it for a while and moves on to
